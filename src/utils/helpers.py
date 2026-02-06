@@ -3,6 +3,7 @@ import json
 import shutil
 from pathlib import Path
 from typing import Dict, Optional, List
+from functools import lru_cache
 from .logger import logger
 import subprocess
 import math
@@ -33,8 +34,8 @@ def get_ffmpeg_path() -> str:
             path = imageio_ffmpeg.get_ffmpeg_exe()
             _ffmpeg_path_cache = path
             return path
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to get ffmpeg from imageio_ffmpeg: {e}")
             
     _ffmpeg_path_cache = "ffmpeg"
     return "ffmpeg" # Fallback
@@ -67,7 +68,20 @@ def format_bitrate(bitrate: int) -> str:
     elif bitrate < 1000000: return f"{bitrate/1000:.2f} Kbps"
     else: return f"{bitrate/1000000:.2f} Mbps"
 
+@lru_cache(maxsize=128)
 def get_video_info(file_path: str) -> Optional[Dict]:
+    """Extract video metadata using ffprobe with LRU caching.
+    
+    Args:
+        file_path: Path to video file
+        
+    Returns:
+        Dict containing streams and format information, or None if extraction fails
+        
+    Note:
+        Results are cached to avoid repeated ffprobe calls for the same file.
+        Cache is limited to 128 entries to prevent unbounded memory growth.
+    """
     try:
         ffmpeg_exe = get_ffmpeg_path()
         # ffprobe is usually in the same dir as ffmpeg if using imageio, but imageio-ffmpeg doesn't expose get_ffprobe_exe directly clearly everywhere.
@@ -90,7 +104,7 @@ def get_video_info(file_path: str) -> Optional[Dict]:
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         result = subprocess.run(cmd, capture_output=True, text=True, check=True, startupinfo=startupinfo)
         return json.loads(result.stdout)
-    except Exception as e:
+    except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError) as e:
         logger.warning(f"Failed to get video info for {file_path}: {e}")
         # Fallback to ffmpeg parsing
         try:
@@ -330,8 +344,8 @@ def generate_thumbnail(file_path: str, output_path: str) -> Optional[str]:
                  dur = float(info.get('format', {}).get('duration', 0))
                  if dur > 0:
                      seek_time = str(dur * 0.5)
-             except:
-                 pass
+             except (ValueError, TypeError, KeyError) as e:
+                 logger.debug(f"Could not parse duration for thumbnail: {e}")
 
         cmd = [
             ffmpeg_exe, 

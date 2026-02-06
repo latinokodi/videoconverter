@@ -5,8 +5,13 @@ from pathlib import Path
 import tempfile
 import shutil
 from typing import Generator
+import sys
+import os
 
-from src.core.converter import Converter, ConversionOptions
+# Add src to path for imports
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+from src.core.converter import ConversionOptions
 from src.core.exceptions import *
 
 
@@ -37,26 +42,6 @@ def sample_video_path(temp_dir: Path) -> Path:
     video_path = temp_dir / "sample.mp4"
     video_path.touch()  # Create empty file for now
     return video_path
-
-
-@pytest.fixture
-def converter_with_cpu() -> Converter:
-    """Create a Converter instance configured for CPU encoding.
-
-    Returns:
-        Converter instance with GPU disabled
-    """
-    return Converter(has_gpu=False)
-
-
-@pytest.fixture
-def converter_with_gpu() -> Converter:
-    """Create a Converter instance configured for GPU encoding.
-
-    Returns:
-        Converter instance with GPU enabled
-    """
-    return Converter(has_gpu=True)
 
 
 @pytest.fixture
