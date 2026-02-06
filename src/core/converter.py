@@ -3,11 +3,78 @@ import subprocess
 import time
 import re
 import traceback
-from typing import Optional, Tuple, Callable
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional, Tuple, Callable, Dict, Any
 from send2trash import send2trash
+
+from .exceptions import (
+    FFmpegNotFoundError,
+    FFmpegExecutionError,
+    ConversionFailedError,
+    InvalidVideoFileError,
+)
 from ..utils.logger import logger
 from ..utils.helpers import get_video_info, format_time_simple, get_ffmpeg_path
 from ..utils.config import config
+
+
+# Constants
+RESOLUTION_1080P = 1080
+DEFAULT_CRF_VALUE = 24
+STDERR_BUFFER_SIZE = 20  # Keep only last N lines of stderr
+
+
+class CodecType(str, Enum):
+    """Supported video codecs."""
+
+    HEVC_NVENC = "hevc_nvenc"
+    LIBX265 = "libx265"
+
+
+@dataclass
+class ConversionOptions:
+    """Configuration options for video conversion.
+
+    Attributes:
+        bitrate: Target bitrate in bps (mutually exclusive with crf)
+        crf: Constant Rate Factor for quality-based encoding (mutually exclusive with bitrate)
+        preset: Encoding preset (e.g., 'medium', 'p4')
+        has_gpu: Whether GPU acceleration should be used
+    """
+
+    bitrate: Optional[int] = None
+    crf: Optional[int] = None
+    preset: str = "medium"
+    has_gpu: bool = False
+
+    def __post_init__(self):
+        """Validate that either bitrate or crf is set, not both."""
+        if self.bitrate is not None and self.crf is not None:
+            raise ValueError("Cannot specify both bitrate and crf")
+        if self.bitrate is None and self.crf is None:
+            # Default to CRF
+            self.crf = DEFAULT_CRF_VALUE
+
+
+@dataclass
+class ConversionResult:
+    """Result of a video conversion operation.
+
+    Attributes:
+        success: Whether the conversion succeeded
+        input_path: Path to the input video file
+        output_path: Path to the output video file (None if failed)
+        error_message: Error message if conversion failed (None if succeeded)
+        original_deleted: Whether the original file was deleted
+    """
+
+    success: bool
+    input_path: Optional[str] = None
+    output_path: Optional[str] = None
+    error_message: Optional[str] = None
+    original_deleted: bool = False
+
 
 def should_downscale_to_1080p(width: int, height: int) -> bool:
     """
