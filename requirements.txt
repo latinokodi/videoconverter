@@ -4,3 +4,5 @@ pillow
 imageio-ffmpeg
 opencv-python
 send2trash
+psutil
+pynvml

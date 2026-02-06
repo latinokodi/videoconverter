@@ -21,6 +21,7 @@ from ..utils.helpers import (
 )
 from .worker import ConversionWorker
 from .preview_window_qt import VideoPreviewWindow
+from .monitor import HardwareMonitorWorker
 from ..core.converter import should_downscale_to_1080p
 from ..utils.scan_cache import ScanCache
 from ..utils.thumb_cache import ThumbnailCache
@@ -476,6 +477,46 @@ class MainWindow(QMainWindow):
         header.addLayout(title_section)
         header.addStretch()
         
+        # Monitor Bars (Header Style - Compact)
+        monitor_container = QWidget()
+        monitor_container.setFixedWidth(200) # Fixed width to look neat in header
+        mon_layout = QVBoxLayout(monitor_container)
+        mon_layout.setContentsMargins(0, 0, 0, 0)
+        mon_layout.setSpacing(4)
+        
+        self.pbar_cpu = QProgressBar()
+        self.pbar_cpu.setRange(0, 100)
+        self.pbar_cpu.setTextVisible(True)
+        self.pbar_cpu.setFormat("CPU: %p%")
+        self.pbar_cpu.setFixedHeight(12)
+        self.pbar_cpu.setStyleSheet("""
+            QProgressBar { border: none; background-color: #333; border-radius: 6px; text-align: center; color: white; font-size: 9px; font-weight: bold; }
+            QProgressBar::chunk { background-color: #2196F3; border-radius: 6px; }
+        """)
+        
+        self.pbar_gpu = QProgressBar()
+        self.pbar_gpu.setRange(0, 100)
+        self.pbar_gpu.setTextVisible(True)
+        self.pbar_gpu.setFormat("GPU: %p%")
+        self.pbar_gpu.setFixedHeight(12)
+        self.pbar_gpu.setStyleSheet("""
+            QProgressBar { border: none; background-color: #333; border-radius: 6px; text-align: center; color: white; font-size: 9px; font-weight: bold; }
+            QProgressBar::chunk { background-color: #4CAF50; border-radius: 6px; }
+        """)
+        
+        mon_layout.addWidget(self.pbar_cpu)
+        mon_layout.addWidget(self.pbar_gpu)
+        
+        header.addWidget(monitor_container)
+        
+        # Start Monitor Thread (Moved here)
+        try:
+            self.hw_worker = HardwareMonitorWorker()
+            self.hw_worker.metrics_updated.connect(self.update_hw_stats)
+            self.hw_worker.start()
+        except Exception as e:
+            logger.error(f"Failed to start HW monitor: {e}")
+
         # GPU Badge
         self.lbl_gpu = QLabel("Checking GPU...")
         self.lbl_gpu.setObjectName("badge")
@@ -578,6 +619,8 @@ class MainWindow(QMainWindow):
         right_layout.addLayout(btn_row1)
         right_layout.addLayout(btn_row2)
         
+
+        
         
         # File Info Panel (Unified)
         self.grp_info = QFrame()
@@ -651,11 +694,7 @@ class MainWindow(QMainWindow):
         self.chk_auto_delete.setStyleSheet("color: #ffcccc;") # Light red hint
         opt_lay.addWidget(self.chk_auto_delete)
 
-        # Smooth Motion Toggle - NEW
-        self.chk_smooth_motion = QCheckBox("Smooth Motion (60fps)")
-        self.chk_smooth_motion.setToolTip("Interpolate frames to 60fps (Slow! Uses CPU)")
-        self.chk_smooth_motion.setStyleSheet("color: #ccffcc;") # Light green hint
-        opt_lay.addWidget(self.chk_smooth_motion)
+
 
         right_layout.addWidget(opt_group)
         
@@ -1344,6 +1383,28 @@ class MainWindow(QMainWindow):
         self.btn_scan.setEnabled(True)
         self.spin_parallel.setEnabled(True)
         self.update_convert_btn()
+
+    def update_hw_stats(self, cpu, gpu, video_engine):
+        self.pbar_cpu.setValue(int(cpu))
+        self.pbar_cpu.setFormat(f"CPU: {int(cpu)}%")
+        
+        if gpu is not None:
+            self.pbar_gpu.setValue(int(gpu))
+            self.pbar_gpu.setFormat(f"GPU: {int(gpu)}%")
+            self.pbar_gpu.setVisible(True)
+        else:
+            self.pbar_gpu.setVisible(False) 
+
+    def closeEvent(self, event):
+        # Stop HW worker
+        if hasattr(self, 'hw_worker'):
+            self.hw_worker.stop()
+        
+        # Stop conversions if running
+        if hasattr(self, 'worker') and self.worker:
+            self.worker.stop()
+            
+        event.accept()
 
     def open_compare(self, widget):
         if widget.out_path and os.path.exists(widget.out_path):
