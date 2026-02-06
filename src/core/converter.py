@@ -85,9 +85,9 @@ def should_downscale_to_1080p(width: int, height: int) -> bool:
         height: Video height in pixels
     
     Returns:
-        True if height > 1080 (meaning >1080p resolution)
+        True if the shortest side > 1080 (meaning >1080p resolution)
     """
-    return height > 1080
+    return min(width, height) > 1080
 
 
 def get_scale_filter(width: int, height: int, has_gpu: bool) -> str:
@@ -223,19 +223,40 @@ class Converter:
             cmd_codec = []
             video_filters = []
 
+            # Smooth Motion Filter (CPU-based)
+            smooth_motion = option.get('smooth_motion', False)
+            minterpolate_filter = "minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1"
+
             # Codec selection logic
             if self.has_gpu:
                 cmd_codec = ['-c:v', 'hevc_nvenc', '-preset', 'p4']
                 
+                # Apply minterpolate BEFORE upload to GPU
+                if smooth_motion:
+                    video_filters.append(minterpolate_filter)
+                    # We might need to ensure format compatibility, but usually minterpolate outputs standard pixel formats
+                    logger.info("Smooth motion enabled (CPU filter before GPU encode)")
+
                 # Use scale_cuda filter for robust GPU resizing
                 if needs_downscale:
-                    # CPU Decode -> hwupload (move to VRAM) -> scale_cuda (resize) -> Encoder
+                    # CPU Decode -> (Optional Minterpolate) -> hwupload (move to VRAM) -> scale_cuda (resize) -> Encoder
                     video_filters.append('hwupload')
                     video_filters.append('scale_cuda=-2:1080:format=nv12')
                     logger.info(f"Hybrid downscaling enabled (hwupload -> scale_cuda): {video_width}x{video_height} -> 1080p")
+                
+                # If smooth motion is ON but downscale is OFF, we still need hwupload if we want to use scale_cuda?
+                # Wait, if we use NVENC, we need frames in GPU memory ONLY if we use GPU filters.
+                # If we don't use scale_cuda (no downscale), can we feed CPU frames to NVENC?
+                # Yes, standard NVENC accepts pixel formats like yuv420p directly if no GPU filters are used in between.
+                # BUT if we have GPU filters (scale_cuda), we MUST have hwupload.
+                
             else:
                 cmd_codec = ['-c:v', 'libx265', '-preset', 'medium']
                 
+                if smooth_motion:
+                    video_filters.append(minterpolate_filter)
+                    logger.info("Smooth motion enabled (CPU)")
+
                 # For CPU, use scale filter
                 if needs_downscale:
                     scale_filter = get_scale_filter(video_width, video_height, has_gpu=False)
@@ -273,7 +294,14 @@ class Converter:
                 logger.warning("No quality settings in option, using default CRF 24")
                 quality_args = ['-rc', 'constqp', '-cq', '24'] if self.has_gpu else ['-crf', '24']
 
-            cmd = cmd_base + cmd_codec + filter_args + quality_args + ['-c:a', 'copy', final_output_path]
+            # Add -fps_mode passthrough ONLY if NOT using smooth motion
+            # (Smooth motion needs to change the frame rate to 60fps via filter)
+            fps_mode_args = []
+            if not smooth_motion:
+                fps_mode_args = ['-fps_mode', 'passthrough']
+            
+            cmd = cmd_base + cmd_codec + filter_args + quality_args + \
+                  fps_mode_args + ['-c:a', 'copy', final_output_path]
             
             logger.info(f"Executing: {' '.join(cmd)}")
             

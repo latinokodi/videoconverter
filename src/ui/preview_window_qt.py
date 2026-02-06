@@ -20,6 +20,7 @@ class ResizableLabel(QLabel):
 
 class VideoPreviewWindow(QWidget):
     closed = pyqtSignal()
+    file_deleted = pyqtSignal(str)
 
     def __init__(self, original_path, converted_path):
         super().__init__()
@@ -232,6 +233,7 @@ class VideoPreviewWindow(QWidget):
                     if hasattr(self, 'cap_orig'):
                         del self.cap_orig
                     deleted = True
+                    self.file_deleted.emit(self.original_path)
                     break
                 except Exception as e:
                     logger.warning(f"Delete attempt {i+1} failed: {e}")

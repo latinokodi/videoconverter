@@ -45,6 +45,9 @@ class FileConversionRunnable(QRunnable):
             # Inject global flags
             if 'delete_flag' in self.item:
                 options['delete_original'] = self.item['delete_flag']
+            
+            if 'smooth_motion' in self.item:
+                options['smooth_motion'] = self.item['smooth_motion']
 
             if self._is_stopped:
                 return

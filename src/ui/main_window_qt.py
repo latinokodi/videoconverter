@@ -648,9 +648,14 @@ class MainWindow(QMainWindow):
         
         # Auto Delete Toggle - NEW
         self.chk_auto_delete = QCheckBox("Auto Delete Original")
-        self.chk_auto_delete.setToolTip("Automatically move original file to recycle bin after successful conversion.")
         self.chk_auto_delete.setStyleSheet("color: #ffcccc;") # Light red hint
         opt_lay.addWidget(self.chk_auto_delete)
+
+        # Smooth Motion Toggle - NEW
+        self.chk_smooth_motion = QCheckBox("Smooth Motion (60fps)")
+        self.chk_smooth_motion.setToolTip("Interpolate frames to 60fps (Slow! Uses CPU)")
+        self.chk_smooth_motion.setStyleSheet("color: #ccffcc;") # Light green hint
+        opt_lay.addWidget(self.chk_smooth_motion)
 
         right_layout.addWidget(opt_group)
         
@@ -1241,7 +1246,8 @@ class MainWindow(QMainWindow):
                 items.append({
                     'path': w.path, 
                     'profile_idx': profile_idx,
-                    'delete_flag': self.chk_auto_delete.isChecked()
+                    'delete_flag': self.chk_auto_delete.isChecked(),
+                    'smooth_motion': self.chk_smooth_motion.isChecked()
                 })
                 
         if not items:
@@ -1273,8 +1279,18 @@ class MainWindow(QMainWindow):
         """Stop the running conversion"""
         if self.worker:
             self.worker.stop()
-            self.lbl_status.setText("Stopping...")
-            self.btn_convert.setEnabled(False) # Prevent multi-clicks
+            self.lbl_status.setText("Stopped by User")
+            
+            # Reset State
+            self.is_converting = False
+            
+            # Reset UI Elements
+            self.btn_convert.setStyleSheet("") # Remove danger style
+            self.update_convert_btn() # Resets text and enabled state
+            
+            self.btn_add.setEnabled(True)
+            self.btn_scan.setEnabled(True)
+            self.spin_parallel.setEnabled(True)
 
     def on_worker_progress(self, val, pct, eta):
         self.progress.setValue(int(val * 100))
@@ -1319,6 +1335,10 @@ class MainWindow(QMainWindow):
     def on_batch_finished(self):
         self.is_converting = False
         self.lbl_status.setText("Batch Complete")
+        
+        # Reset UI
+        self.btn_convert.setStyleSheet("") 
+        
         QMessageBox.information(self, "Done", "Batch conversion finished.")
         self.btn_convert.setEnabled(True)
         self.btn_add.setEnabled(True)
@@ -1328,8 +1348,36 @@ class MainWindow(QMainWindow):
 
     def open_compare(self, widget):
         if widget.out_path and os.path.exists(widget.out_path):
+
             self.preview = VideoPreviewWindow(widget.path, widget.out_path)
+            self.preview.file_deleted.connect(self.on_preview_file_deleted)
             self.preview.show()
         else:
-            QMessageBox.error(self, "Error", "Output file not found.")
+            QMessageBox.critical(self, "Error", "Output file not found.")
+
+    def on_preview_file_deleted(self, path):
+        """Handle file deletion from preview window"""
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            w = self.list_widget.itemWidget(item)
+            if w and w.path == path:
+                # Remove from UI
+                row = self.list_widget.row(item)
+                self.list_widget.takeItem(row) # This deletes the item and widget
+                
+                # Cleanup internal state
+                if path in self.added_paths:
+                    self.added_paths.remove(path)
+                
+                # Cleanup Cache
+                try:
+                    ThumbnailCache().remove_entry(path)
+                    logger.info(f"Cleaned up cache for deleted file: {path}")
+                except Exception as e:
+                    logger.error(f"Failed to clean cache for {path}: {e}")
+                
+                self.update_dashboard_counts()
+                self.update_convert_btn()
+                self._update_info_panel([]) # Clear info panel if it was showing this file
+                break
 
