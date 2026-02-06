@@ -1,0 +1,19 @@
+
+# Create a new Conda environment in the current directory
+conda create --prefix ./video_converter_env python=3.9
+
+# Activate the environment
+conda activate ./video_converter_env
+
+# Install required packages
+conda install -c conda-forge ffmpeg
+pip install pathlib
+
+# Save the script to a file
+# (Copy the script from above to a file named 'video_converter.py')
+
+# Make the script executable (Linux/macOS only)
+chmod +x video_converter.py
+
+# Run the script
+python video_converter.py

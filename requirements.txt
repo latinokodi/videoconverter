@@ -1,0 +1,6 @@
+PyQt6
+qt-material
+pillow
+imageio-ffmpeg
+opencv-python
+send2trash
