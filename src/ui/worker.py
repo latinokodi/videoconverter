@@ -51,14 +51,16 @@ class FileConversionRunnable(QRunnable):
 
             # Execute conversion
             delete_original = options.get('delete_original', False)
-            success, result_path, error_msg = self.converter.convert_single_file(input_path, options, delete_original=delete_original)
+            success_tuple = self.converter.convert_single_file(input_path, options, delete_original=delete_original)
             
             if self._is_stopped:
                 return
 
-            if success:
+            if success_tuple[0]: # Success
+                _, _, result_path = success_tuple
                 self.signals.finished.emit(input_path, True, result_path, delete_original)
-            else:
+            else: # Failure
+                _, error_msg, _ = success_tuple
                 self.signals.finished.emit(input_path, False, error_msg if error_msg else "Unknown Error", False)
                 
         except Exception as e:

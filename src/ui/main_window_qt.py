@@ -1310,6 +1310,7 @@ class MainWindow(QMainWindow):
                         # Enable compare
                         w.btn_compare.setEnabled(True)
                         w.setStyleSheet("background-color: #1e3d2f;") # Subtle hint
+                 else:
                      w.set_status("Failed", "#F44336")
                      w.setStyleSheet("background-color: #3d1e1e;")
             

@@ -1,5 +1,6 @@
 import cv2
 import os
+import time
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QPushButton, QSlider, QHBoxLayout, QVBoxLayout, 
     QMessageBox, QFrame, QSizePolicy, QApplication
@@ -219,18 +220,28 @@ class VideoPreviewWindow(QWidget):
             if hasattr(self, 'cap_orig'):
                 self.cap_orig.release()
                 
-            try:
-                send2trash(self.original_path)
-                logger.info(f"Sent to trash: {self.original_path}")
-                self.btn_del_orig.setEnabled(False)
-                self.btn_del_orig.setText("Deleted")
-                self.lbl_orig.setText("File Deleted")
-                del self.cap_orig
-            except Exception as e:
+            # Retry logic for Windows file locking
+            deleted = False
+            for i in range(3):
+                try:
+                    send2trash(self.original_path)
+                    logger.info(f"Sent to trash: {self.original_path}")
+                    self.btn_del_orig.setEnabled(False)
+                    self.btn_del_orig.setText("Deleted")
+                    self.lbl_orig.setText("File Deleted")
+                    if hasattr(self, 'cap_orig'):
+                        del self.cap_orig
+                    deleted = True
+                    break
+                except Exception as e:
+                    logger.warning(f"Delete attempt {i+1} failed: {e}")
+                    time.sleep(0.5)
+            
+            if not deleted:
                 # Try to recover capture if delete failed
                 self.cap_orig = cv2.VideoCapture(self.original_path)
-                logger.error(f"Error deleting file: {e}")
-                QMessageBox.critical(self, "Error", f"Could not delete file:\n{e}")
+                logger.error(f"Failed to delete original file after retries.")
+                QMessageBox.critical(self, "Error", "Could not delete file. It may be in use.")
 
     def delete_converted(self):
         ret = QMessageBox.question(self, "Confirm Delete", "Send CONVERTED file to Recycle Bin?")
@@ -242,18 +253,28 @@ class VideoPreviewWindow(QWidget):
             if hasattr(self, 'cap_conv'):
                 self.cap_conv.release()
                 
-            try:
-                send2trash(self.converted_path)
-                logger.info(f"Sent to trash: {self.converted_path}")
-                self.btn_del_conv.setEnabled(False)
-                self.btn_del_conv.setText("Deleted")
-                self.lbl_conv.setText("File Deleted")
-                del self.cap_conv
-            except Exception as e:
+            # Retry logic for Windows file locking
+            deleted = False
+            for i in range(3):
+                try:
+                    send2trash(self.converted_path)
+                    logger.info(f"Sent to trash: {self.converted_path}")
+                    self.btn_del_conv.setEnabled(False)
+                    self.btn_del_conv.setText("Deleted")
+                    self.lbl_conv.setText("File Deleted")
+                    if hasattr(self, 'cap_conv'):
+                        del self.cap_conv
+                    deleted = True
+                    break
+                except Exception as e:
+                    logger.warning(f"Delete attempt {i+1} failed: {e}")
+                    time.sleep(0.5)
+            
+            if not deleted:
                 # Try to recover capture if delete failed
                 self.cap_conv = cv2.VideoCapture(self.converted_path)
-                logger.error(f"Error deleting file: {e}")
-                QMessageBox.critical(self, "Error", f"Could not delete file:\n{e}")
+                logger.error(f"Failed to delete converted file after retries.")
+                QMessageBox.critical(self, "Error", "Could not delete file. It may be in use.")
 
     def closeEvent(self, event):
         self.timer.stop()
