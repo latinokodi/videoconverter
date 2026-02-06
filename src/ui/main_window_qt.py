@@ -1246,8 +1246,7 @@ class MainWindow(QMainWindow):
                 items.append({
                     'path': w.path, 
                     'profile_idx': profile_idx,
-                    'delete_flag': self.chk_auto_delete.isChecked(),
-                    'smooth_motion': self.chk_smooth_motion.isChecked()
+                    'delete_flag': self.chk_auto_delete.isChecked()
                 })
                 
         if not items:

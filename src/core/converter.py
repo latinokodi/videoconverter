@@ -221,22 +221,13 @@ class Converter:
             
             cmd_base.extend(['-i', input_path])
             cmd_codec = []
+            cmd_codec = []
             video_filters = []
-
-            # Smooth Motion Filter (CPU-based)
-            smooth_motion = option.get('smooth_motion', False)
-            minterpolate_filter = "minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1"
 
             # Codec selection logic
             if self.has_gpu:
                 cmd_codec = ['-c:v', 'hevc_nvenc', '-preset', 'p4']
                 
-                # Apply minterpolate BEFORE upload to GPU
-                if smooth_motion:
-                    video_filters.append(minterpolate_filter)
-                    # We might need to ensure format compatibility, but usually minterpolate outputs standard pixel formats
-                    logger.info("Smooth motion enabled (CPU filter before GPU encode)")
-
                 # Use scale_cuda filter for robust GPU resizing
                 if needs_downscale:
                     # CPU Decode -> (Optional Minterpolate) -> hwupload (move to VRAM) -> scale_cuda (resize) -> Encoder
@@ -253,10 +244,6 @@ class Converter:
             else:
                 cmd_codec = ['-c:v', 'libx265', '-preset', 'medium']
                 
-                if smooth_motion:
-                    video_filters.append(minterpolate_filter)
-                    logger.info("Smooth motion enabled (CPU)")
-
                 # For CPU, use scale filter
                 if needs_downscale:
                     scale_filter = get_scale_filter(video_width, video_height, has_gpu=False)
@@ -294,14 +281,9 @@ class Converter:
                 logger.warning("No quality settings in option, using default CRF 24")
                 quality_args = ['-rc', 'constqp', '-cq', '24'] if self.has_gpu else ['-crf', '24']
 
-            # Add -fps_mode passthrough ONLY if NOT using smooth motion
-            # (Smooth motion needs to change the frame rate to 60fps via filter)
-            fps_mode_args = []
-            if not smooth_motion:
-                fps_mode_args = ['-fps_mode', 'passthrough']
-            
+            # Add -fps_mode passthrough for output
             cmd = cmd_base + cmd_codec + filter_args + quality_args + \
-                  fps_mode_args + ['-c:a', 'copy', final_output_path]
+                  ['-fps_mode', 'passthrough', '-c:a', 'copy', final_output_path]
             
             logger.info(f"Executing: {' '.join(cmd)}")
             
