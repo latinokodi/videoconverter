@@ -261,12 +261,10 @@ def calculate_bitrates(file_size: int, duration: float, video_info: Dict) -> Lis
 
 def calculate_quality_options(file_size: int, duration: float, video_info: Dict) -> List[Dict]:
     """
-    Calculate quality encoding options using percentage-based file size reduction.
+    Calculate quality encoding options using adaptive CRF values.
     
-    Uses VBR (Variable Bitrate) encoding to achieve target file sizes:
-    - 60% Reduction: Output is 40% of original size
-    - 50% Reduction: Output is 50% of original size
-    - 40% Reduction: Output is 60% of original size
+    Replaces bitrate-based encoding with quality-based CRF targeting.
+    Provides more consistent visual quality across different video lengths.
     
     Args:
         file_size: Input file size in bytes
@@ -274,11 +272,8 @@ def calculate_quality_options(file_size: int, duration: float, video_info: Dict)
         video_info: FFprobe video information dict
     
     Returns:
-        List of quality options with target bitrates and estimated sizes
+        List of quality options with CRF values and estimated sizes
     """
-    if duration == 0:
-        duration = 1  # Avoid division by zero
-    
     width, height = 0, 0
     for stream in video_info.get('streams', []):
         if stream.get('codec_type') == 'video':
@@ -289,23 +284,30 @@ def calculate_quality_options(file_size: int, duration: float, video_info: Dict)
     is_4k = width >= 3840 or height >= 2160
     options = []
     
-    # Compression percentages: (name, output_size_factor)
-    # 60% reduction means output is 40% of original
-    percentages = [
-        ("60% Reduction", 0.40),
-        ("50% Reduction", 0.50),
-        ("40% Reduction", 0.60)
+    profiles = [
+        "High Quality",
+        "Balanced",
+        "Compact",
+        "Low Bitrate"
     ]
     
-    for name, size_factor in percentages:
-        target_size = int(file_size * size_factor)
-        # Calculate target bitrate: (target_size * 8 bits/byte) / duration
-        target_bitrate = int((target_size * 8) / duration)
+    for profile in profiles:
+        crf = calculate_adaptive_crf(duration, profile, is_4k)
+        
+        # Estimate output size based on CRF
+        # CRF produces variable bitrate, so these are rough estimates
+        # Lower CRF (better quality) = larger file
+        # Formula: size_factor = 1.0 - (crf - 15) * 0.04
+        # CRF 20 ≈ 0.80 (80% of input)
+        # CRF 24 ≈ 0.64 (64% of input)
+        # CRF 28 ≈ 0.48 (48% of input)
+        # CRF 32 ≈ 0.32 (32% of input)
+        size_factor = max(0.2, 1.0 - (crf - 15) * 0.04)
         
         options.append({
-            "name": name,
-            "bitrate": target_bitrate,
-            "estimated_size": target_size,
+            "name": profile,
+            "crf": crf,
+            "estimated_size": int(file_size * size_factor),
             "is_4k": is_4k
         })
     

@@ -621,7 +621,7 @@ class MainWindow(QMainWindow):
         self.radio_layout.setSpacing(20)
         self.radios = []
         
-        options = ["60% Reduction", "50% Reduction", "40% Reduction"]
+        options = ["High Quality", "Balanced", "Compact", "Low Bitrate"]
         for i, name in enumerate(options):
             rb = QRadioButton(name)
             self.radio_group.addButton(rb, i)
@@ -629,7 +629,7 @@ class MainWindow(QMainWindow):
             self.radios.append(rb)
             rb.toggled.connect(self.update_output_preview)
             
-        self.radios[1].setChecked(True) # 50% Reduction default
+        self.radios[3].setChecked(True) # Low Bitrate default
         opt_lay.addLayout(self.radio_layout)
         
         # Parallel Task Selector - NEW
@@ -650,7 +650,6 @@ class MainWindow(QMainWindow):
         self.chk_auto_delete = QCheckBox("Auto Delete Original")
         self.chk_auto_delete.setToolTip("Automatically move original file to recycle bin after successful conversion.")
         self.chk_auto_delete.setStyleSheet("color: #ffcccc;") # Light red hint
-        self.chk_auto_delete.toggled.connect(self.on_auto_delete_toggled)
         opt_lay.addWidget(self.chk_auto_delete)
 
         right_layout.addWidget(opt_group)
@@ -1036,11 +1035,6 @@ class MainWindow(QMainWindow):
             widget = FileListItem(path)
             # Icons are set in FileListItem init
             
-            # Disable comparison button if auto delete is enabled
-            if self.chk_auto_delete.isChecked():
-                widget.btn_compare.setEnabled(False)
-                widget.btn_compare.setToolTip("Compare unavailable when Auto Delete is enabled")
-            
             widget.checkbox.toggled.connect(self.on_active_data_changed)
             widget.btn_compare.clicked.connect(lambda ch, w=widget: self.open_compare(w))
             widget.btn_remove.clicked.connect(lambda ch, it=item: self.remove_item(it))
@@ -1150,7 +1144,7 @@ class MainWindow(QMainWindow):
                     rb.setText(f"{opt['name']} (~{format_size(opt['estimated_size'])})")
         else:
             # Multi-file: Reset labels to default names
-            options = ["60% Reduction", "50% Reduction", "40% Reduction"]
+            options = ["High Quality", "Balanced", "Compact", "Low Bitrate"]
             for i, name in enumerate(options):
                 if i < len(self.radios):
                     self.radios[i].setText(name)
@@ -1172,29 +1166,6 @@ class MainWindow(QMainWindow):
         
         self.btn_convert.setEnabled(count > 0 and not self.is_converting)
         self.btn_convert.setText(f"Convert {count} File(s)" if count > 0 else "Select Files")
-
-    def on_auto_delete_toggled(self, checked: bool):
-        """Disable/enable comparison buttons when auto delete is toggled."""
-        # When auto delete is enabled, disable all comparison buttons
-        # since original files won't exist after conversion
-        for i in range(self.list_widget.count()):
-            item = self.list_widget.item(i)
-            widget = self.list_widget.itemWidget(item)
-            if widget and hasattr(widget, 'btn_compare'):
-                if checked:
-                    # Auto delete is ON - disable comparison
-                    widget.btn_compare.setEnabled(False)
-                    widget.btn_compare.setToolTip("Compare unavailable when Auto Delete is enabled")
-                else:
-                    # Auto delete is OFF - restore original state
-                    # Only enable if conversion is complete and output exists
-                    if widget.out_path and os.path.exists(widget.out_path):
-                        widget.btn_compare.setEnabled(True)
-                        widget.btn_compare.setToolTip("Compare Original vs Converted")
-                    else:
-                        widget.btn_compare.setEnabled(False)
-                        widget.btn_compare.setToolTip("Compare Original vs Converted")
-
 
     def update_dashboard_counts(self):
         """Recalculate and update dashboard statistics"""
@@ -1336,11 +1307,9 @@ class MainWindow(QMainWindow):
                      else:
                         w.set_status("Done", "#4CAF50")
                         w.out_path = result
-                        # Enable compare only if auto delete is not enabled
-                        if not self.chk_auto_delete.isChecked():
-                            w.btn_compare.setEnabled(True)
+                        # Enable compare
+                        w.btn_compare.setEnabled(True)
                         w.setStyleSheet("background-color: #1e3d2f;") # Subtle hint
-                 else:
                      w.set_status("Failed", "#F44336")
                      w.setStyleSheet("background-color: #3d1e1e;")
             
