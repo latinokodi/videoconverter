@@ -160,6 +160,7 @@ def get_video_info(file_path: str) -> Optional[Dict]:
 
 def get_video_codec_only(file_path: str) -> Optional[str]:
     try:
+        file_path = str(Path(file_path))  # Normalize mixed slashes
         ffmpeg_exe = get_ffmpeg_path()
         ffprobe_exe = "ffprobe"
         if ffmpeg_exe != "ffmpeg" and os.path.exists(ffmpeg_exe):

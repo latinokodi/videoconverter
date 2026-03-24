@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, 
     QListWidget, QListWidgetItem, QProgressBar, QFileDialog, QMessageBox,
     QFrame, QRadioButton, QButtonGroup, QScrollArea, QAbstractItemView, QCheckBox,
-    QSizePolicy, QStyle, QSpinBox
+    QSizePolicy, QStyle, QSpinBox, QComboBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QSize, QEvent, QThreadPool, QRunnable
 from PyQt6.QtGui import QIcon, QPixmap, QAction, QDragEnterEvent, QDropEvent
@@ -17,71 +17,18 @@ from ..utils.config import config
 from ..utils.helpers import (
     normalize_path, get_video_info, get_video_codec_only,
     format_size, calculate_bitrates, calculate_quality_options, format_bitrate,
-    format_time_simple, get_ffmpeg_path, generate_thumbnail
+    format_time_simple, get_ffmpeg_path
 )
 from .worker import ConversionWorker
 from .preview_window_qt import VideoPreviewWindow
 from .monitor import HardwareMonitorWorker
 from ..core.converter import should_downscale_to_1080p
 from ..utils.scan_cache import ScanCache
-from ..utils.thumb_cache import ThumbnailCache
 from send2trash import send2trash
 
-# --- Helper for Async Thumbnails ---
-class ThumbnailSignaller(QObject):
-    finished = pyqtSignal(str, str) # item_path, thumb_path
-
-class ThumbnailRunnable(QRunnable):
-    def __init__(self, path, signaller):
-        super().__init__()
-        self.path = path
-        self.signaller = signaller
-    
-    def run(self):
-        import tempfile
-        import time
-        try:
-            # Check Cache First
-            cache = ThumbnailCache()
-            try:
-                stat = os.stat(self.path)
-                mtime = stat.st_mtime
-                size = stat.st_size
-                
-                cached_thumb = cache.get_entry(self.path, mtime, size)
-                if cached_thumb:
-                    self.signaller.finished.emit(self.path, cached_thumb)
-                    return
-            except OSError:
-                pass
-
-            # Generate new
-            # Store in 'thumbs' folder in app data or local
-            # Let's use a 'thumbs' folder next to executable for portability or logic
-            # Using src/../thumbs
-            base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-            thumbs_dir = os.path.join(base_dir, "thumbs")
-            if not os.path.exists(thumbs_dir):
-                os.makedirs(thumbs_dir, exist_ok=True)
-                
-            fname = f"{os.path.basename(self.path)}_{int(time.time())}.jpg"
-            # Sanitize filename? simple hash might be better to avoid length issues
-            # But user wants simple.
-            out = os.path.join(thumbs_dir, fname)
-            
-            res = generate_thumbnail(self.path, out)
-            if res:
-                # Update Cache
-                if os.path.exists(self.path):
-                    cache.update_entry(self.path, mtime, size, res)
-                    cache.save()
-                    
-                self.signaller.finished.emit(self.path, res)
-        except Exception as e:
-            logger.error(f"Thumb generation failed: {e}")
 
 class MetadataSignaller(QObject):
-    finished = pyqtSignal(str, str) # path, codec
+    finished = pyqtSignal(str, dict, str) # path, info_dict, codec
 
 class MetadataRunnable(QRunnable):
     def __init__(self, path, signaller):
@@ -91,99 +38,164 @@ class MetadataRunnable(QRunnable):
     
     def run(self):
         try:
-            # Check Cache First
+            from pathlib import Path as _P
+            norm_path = str(_P(self.path))
+
+            # Check details cache first
+            from ..utils.scan_cache import ScanCache
             cache = ScanCache()
             try:
-                stat = os.stat(self.path)
-                mtime = stat.st_mtime
-                size = stat.st_size
-                
-                cached_codec = cache.get_cached_result(self.path, mtime, size)
-                if cached_codec:
-                    self.signaller.finished.emit(self.path, cached_codec)
+                st = os.stat(norm_path)
+                cached = cache.get_cached_details(norm_path, st.st_mtime, st.st_size)
+                if cached:
+                    # Build a minimal info dict from cached data so widget can render
+                    info = {
+                        'streams': [{
+                            'codec_type': 'video',
+                            'codec_name': cached['codec'],
+                            'width': cached['width'],
+                            'height': cached['height'],
+                        }],
+                        'format': {'duration': str(cached['duration'])}
+                    }
+                    self.signaller.finished.emit(norm_path, info, cached['codec'])
                     return
-                
-                # If not cached, detect
-                codec = get_video_codec_only(self.path)
-                if codec:
-                     # Do NOT save here (Thread race condition)
-                     # Just return result
-                     self.signaller.finished.emit(self.path, codec)
-            except Exception as e:
-                logger.error(f"Metadata check error for {self.path}: {e}")
+            except OSError:
+                pass
 
+            # Cache miss — probe with ffprobe
+            from ..utils.helpers import get_video_info
+            info = get_video_info(norm_path)
+            codec = 'Unknown'
+            width = height = 0
+            duration = 0.0
+            if info:
+                vid = next((s for s in info.get('streams', []) if s.get('codec_type') == 'video'), {})
+                codec = vid.get('codec_name', 'Unknown')
+                width = vid.get('width', 0)
+                height = vid.get('height', 0)
+                duration = float(info.get('format', {}).get('duration', 0))
+                # Persist to cache
+                try:
+                    st = os.stat(norm_path)
+                    cache.update_details(norm_path, st.st_mtime, st.st_size,
+                                         codec, width, height, duration)
+                    cache.save()
+                except OSError:
+                    pass
+
+            self.signaller.finished.emit(norm_path, info or {}, codec)
         except Exception as e:
-            logger.error(f"Metadata runnable failed: {e}")
+            logger.error(f"Metadata runnable failed for {self.path}: {e}")
 
 class FileListItem(QWidget):
-    """Custom Widget for the List Item."""
+    """Custom Integrated Widget for the List Item."""
     def __init__(self, path: str, parent=None):
         super().__init__(parent)
         self.path = path
-        self.thumb_path = None
         self.out_path = None
         self.video_info = None # Cache video info
+        self.codec = "Unknown"
         
+        from PyQt6.QtWidgets import QHBoxLayout, QVBoxLayout, QCheckBox, QLabel, QComboBox, QPushButton
+        from PyQt6.QtCore import Qt
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setContentsMargins(8, 2, 8, 2)
+        layout.setSpacing(12)
         
         # Checkbox
         self.checkbox = QCheckBox()
         self.checkbox.setChecked(False)
         layout.addWidget(self.checkbox)
         
-        # Thumbnail
-        self.lbl_thumb = QLabel()
-        self.lbl_thumb.setFixedSize(80, 45)
-        self.lbl_thumb.setStyleSheet("background-color: #000; border-radius: 4px; border: 1px solid #444;")
-        self.lbl_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_thumb.setText("...")
-        layout.addWidget(self.lbl_thumb)
+        # Filename
+        import os
+        filename = os.path.basename(path)
+        if len(filename) > 55: filename = filename[:52] + "..."
+        self.lbl_name = QLabel(filename)
+        self.lbl_name.setStyleSheet("font-weight: bold; font-size: 12px; color: #e0e0e0;")
+        self.lbl_name.setMinimumWidth(200)
+        layout.addWidget(self.lbl_name, stretch=1)
         
-        # Text Info
-        text_layout = QVBoxLayout()
-        text_layout.setSpacing(2)
+        # Details (resolution | codec | size | duration)
+        self.lbl_details = QLabel("Loading...")
+        self.lbl_details.setStyleSheet("color: #a0a0a0; font-size: 11px;")
+        self.lbl_details.setMinimumWidth(180)
+        layout.addWidget(self.lbl_details)
         
-        self.lbl_name = QLabel(os.path.basename(path))
-        self.lbl_name.setStyleSheet("font-weight: bold;")
-        text_layout.addWidget(self.lbl_name)
-        
+        # Status
         self.lbl_status = QLabel("Pending")
-        self.lbl_status.setStyleSheet("color: gray; font-size: 10px;")
-        text_layout.addWidget(self.lbl_status)
+        self.lbl_status.setStyleSheet("color: gray; font-size: 11px; font-weight: bold;")
+        self.lbl_status.setFixedWidth(80)
+        layout.addWidget(self.lbl_status)
         
-        layout.addLayout(text_layout)
-        layout.addStretch()
+        # Quality combo
+        self.combo_quality = QComboBox()
+        self.combo_quality.addItems(["High Quality", "Balanced", "Compact", "Low Bitrate"])
+        self.combo_quality.setCurrentIndex(2)  # Default: Compact
+        self.combo_quality.setFixedWidth(120)
+        layout.addWidget(self.combo_quality)
         
-        # Compare Button
-        self.btn_compare = QPushButton("\u25B6") # Play symbol
+        # Estimated size
+        self.lbl_est_size = QLabel("Est: --")
+        self.lbl_est_size.setStyleSheet("color: #4CAF50; font-weight: bold; font-size: 11px;")
+        self.lbl_est_size.setFixedWidth(90)
+        self.lbl_est_size.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(self.lbl_est_size)
+        
+        # Action buttons
+        self.btn_compare = QPushButton("▶")
         self.btn_compare.setObjectName("icon_button")
         self.btn_compare.setToolTip("Compare Original vs Converted")
-        self.btn_compare.setFixedSize(28, 28)
+        self.btn_compare.setFixedSize(26, 26)
         self.btn_compare.setEnabled(False)
         layout.addWidget(self.btn_compare)
         
-        # Remove Button
-        self.btn_remove = QPushButton("\U0001F5D1") # Trash can
+        self.btn_remove = QPushButton("🗑")
         self.btn_remove.setObjectName("danger_icon_button")
         self.btn_remove.setToolTip("Remove and Delete File")
-        self.btn_remove.setFixedSize(28, 28)
+        self.btn_remove.setFixedSize(26, 26)
         layout.addWidget(self.btn_remove)
-
-    def set_thumbnail(self, path):
-        self.thumb_path = path
-        pix = QPixmap(path)
-        self.lbl_thumb.setPixmap(pix.scaled(
-            self.lbl_thumb.size(), 
-            Qt.AspectRatioMode.KeepAspectRatio, 
-            Qt.TransformationMode.SmoothTransformation
-        ))
         
+        # Keep row compact
+        self.setFixedHeight(36)
+        
+        self.combo_quality.currentIndexChanged.connect(self.refresh_details)
+
+
+
     def set_status(self, status, color=None):
         self.lbl_status.setText(status)
         if color:
-            self.lbl_status.setStyleSheet(f"color: {color}; font-size: 10px;")
+            self.lbl_status.setStyleSheet(f"color: {color}; font-size: 11px; font-weight: bold;")
 
+    def refresh_details(self):
+        if not getattr(self, 'video_info', None):
+            return
+            
+        import os
+        try:
+            size = os.path.getsize(self.path)
+        except OSError:
+            size = 0
+            
+        dur = float(self.video_info.get('format', {}).get('duration', 0))
+        streams = self.video_info.get('streams', [])
+        vid = next((s for s in streams if s.get('codec_type', '') == 'video'), {})
+        w, h = vid.get('width', 0), vid.get('height', 0)
+        codec = getattr(self, 'codec', 'Unknown')
+        
+        # Update source info
+        from ..utils.helpers import format_size, format_time_simple
+        self.lbl_details.setText(f"{w}x{h} | {codec.upper()} | {format_size(size)} | {format_time_simple(dur)}")
+        
+        # Target estimate
+        from ..utils.helpers import calculate_quality_options
+        opts = calculate_quality_options(size, dur, self.video_info)
+        idx = self.combo_quality.currentIndex()
+        if idx < len(opts):
+            est = opts[idx]['estimated_size']
+            self.lbl_est_size.setText(f"Est: ~{format_size(est)}")
 class SortableListWidgetItem(QListWidgetItem):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -195,162 +207,6 @@ class SortableListWidgetItem(QListWidgetItem):
         # If DescendingOrder is used: larger > smaller.
         # standard __lt__ is "is self less than other?".
         return self.file_size < other.file_size
-
-class CombinedInfoCard(QFrame):
-    """Unified card to display both input file details and output preview."""
-    def __init__(self, data, profile_idx, bitrates_data, has_gpu):
-        super().__init__()
-        self.setObjectName("info_card")
-        self.setStyleSheet("background-color: #2b2b2b; border-radius: 6px; border: 1px solid #3d3d3d;")
-        self.setMaximumWidth(850)  # Prevent horizontal scrollbar
-        
-        # Main horizontal layout: [Input Section] | [Output Section]
-        main_layout = QHBoxLayout(self)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(12)
-        
-        # ==================== INPUT SECTION (LEFT) ====================
-        input_section = QVBoxLayout()
-        input_section.setSpacing(6)
-        
-        # Section Header
-        input_header = QLabel("📁 SELECTED FILE INFO")
-        input_header.setStyleSheet("font-weight: bold; font-size: 11px; color: #888; text-transform: uppercase;")
-        input_section.addWidget(input_header)
-        
-        # Input Filename (truncate if too long)
-        filename = data['filename']
-        if len(filename) > 40:
-            filename = filename[:37] + "..."
-        lbl_input_name = QLabel(filename)
-        lbl_input_name.setStyleSheet("font-weight: bold; font-size: 12px; color: #e0e0e0; margin-top: 4px;")
-        lbl_input_name.setWordWrap(True)
-        input_section.addWidget(lbl_input_name)
-        
-        # Input Details Row 1: Resolution | Codec
-        input_row1 = QHBoxLayout()
-        input_row1.setSpacing(8)
-        lbl_input_res = QLabel(f"{data['width']}x{data['height']}")
-        lbl_input_res.setStyleSheet("color: #a0a0a0; font-size: 11px;")
-        lbl_input_codec = QLabel(data['codec'])
-        lbl_input_codec.setStyleSheet("color: #a0a0a0; font-size: 11px;")
-        input_row1.addWidget(lbl_input_res)
-        input_row1.addWidget(QLabel("|"))
-        input_row1.addWidget(lbl_input_codec)
-        input_row1.addStretch()
-        input_section.addLayout(input_row1)
-        
-        # Input Details Row 2: Size | Duration
-        input_row2 = QHBoxLayout()
-        input_row2.setSpacing(8)
-        lbl_input_size = QLabel(format_size(data['size']))
-        lbl_input_size.setStyleSheet("color: #a0a0a0; font-size: 11px;")
-        lbl_input_dur = QLabel(format_time_simple(data['duration']))
-        lbl_input_dur.setStyleSheet("color: #a0a0a0; font-size: 11px;")
-        input_row2.addWidget(lbl_input_size)
-        input_row2.addWidget(QLabel("|"))
-        input_row2.addWidget(lbl_input_dur)
-        input_row2.addStretch()
-        input_section.addLayout(input_row2)
-        
-        input_section.addStretch()
-        
-        # Add input section to main layout
-        main_layout.addLayout(input_section, stretch=1)
-        
-        # ==================== VERTICAL DIVIDER ====================
-        divider = QFrame()
-        divider.setFrameShape(QFrame.Shape.VLine)
-        divider.setStyleSheet("background-color: #3d3d3d;")
-        divider.setFixedWidth(1)
-        main_layout.addWidget(divider)
-        
-        # ==================== OUTPUT SECTION (RIGHT) ====================
-        output_section = QVBoxLayout()
-        output_section.setSpacing(6)
-        
-        # Section Header
-        output_header = QLabel("📤 OUTPUT PREVIEW")
-        output_header.setStyleSheet("font-weight: bold; font-size: 11px; color: #888; text-transform: uppercase;")
-        output_section.addWidget(output_header)
-        
-        # Calculate projected output filename
-        out_name_base, _ = os.path.splitext(data['filename'])
-        if "2160p" in out_name_base:
-            out_name_base = out_name_base.replace("2160p", "")
-        if "2160" in out_name_base:
-            out_name_base = out_name_base.replace("2160", "")
-        out_name = f"{out_name_base}_hevc.mp4"
-        
-        # Output Filename
-        lbl_output_name = QLabel(out_name)
-        lbl_output_name.setStyleSheet("font-weight: bold; font-size: 12px; color: #e0e0e0; margin-top: 4px;")
-        lbl_output_name.setWordWrap(True)
-        output_section.addWidget(lbl_output_name)
-        
-        # Output Details (if profile data available)
-        if profile_idx < len(bitrates_data):
-            opt = bitrates_data[profile_idx]
-            est_size = opt['estimated_size']
-            
-            # Estimated Size (highlighted)
-            lbl_est = QLabel(f"Est: ~{format_size(est_size)}")
-            lbl_est.setStyleSheet("font-weight: bold; color: #4CAF50; font-size: 12px; margin-top: 2px;")
-            output_section.addWidget(lbl_est)
-            
-            # Resolution calculation
-            w, h = data.get('width', 0), data.get('height', 0)
-            if w and h:
-                if should_downscale_to_1080p(w, h):
-                    out_h = 1080
-                    out_w = int(w * (1080 / h))
-                    if out_w % 2 != 0: out_w += 1
-                    res_text = f"{out_w}x{out_h} (Scaled)"
-                else:
-                    res_text = f"{w}x{h} (Original)"
-            else:
-                res_text = "Unknown Res"
-            
-            # Quality metric: CRF or bitrate
-            if 'crf' in opt:
-                # New CRF-based system
-                quality_text = f"CRF {opt['crf']}"
-            elif 'bitrate' in opt:
-                # Legacy bitrate system
-                quality_text = format_bitrate(opt['bitrate'])
-            else:
-                quality_text = "Auto"
-            
-            # Output Details Row: Resolution | Quality
-            output_row = QHBoxLayout()
-            output_row.setSpacing(8)
-            lbl_output_res = QLabel(res_text)
-            lbl_output_res.setStyleSheet("color: #a0a0a0; font-size: 11px;")
-            lbl_output_quality = QLabel(quality_text)
-            lbl_output_quality.setStyleSheet("color: #a0a0a0; font-size: 11px;")
-            output_row.addWidget(lbl_output_res)
-            output_row.addWidget(QLabel("|"))
-            output_row.addWidget(lbl_output_quality)
-            output_row.addStretch()
-            output_section.addLayout(output_row)
-            
-            # Encoder
-            encoder = 'HEVC_NVENC' if has_gpu else 'HEVC (x265)'
-            lbl_encoder = QLabel(encoder)
-            lbl_encoder.setStyleSheet("color: #666; font-size: 10px;")
-            output_section.addWidget(lbl_encoder)
-        else:
-            # No profile data available
-            lbl_no_profile = QLabel("-")
-            lbl_no_profile.setStyleSheet("color: #666;")
-            output_section.addWidget(lbl_no_profile)
-        
-        output_section.addStretch()
-        
-        # Add output section to main layout
-        main_layout.addLayout(output_section, stretch=1)
-
-
 
 class MainWindow(QMainWindow):
     # Signal to update GPU status from background thread
@@ -375,7 +231,7 @@ class MainWindow(QMainWindow):
         # Exclude modern efficient codecs that don't benefit from HEVC conversion
         # AV1: Already more efficient than HEVC
         # HEVC/H265: Already the target format
-        excluded_codecs = ['av1', 'hevc', 'h265']
+        excluded_codecs = ['av1', 'hevc', 'h265', 'x265']
         
         return any(excluded in codec_lower for excluded in excluded_codecs)
     
@@ -399,10 +255,6 @@ class MainWindow(QMainWindow):
         self.is_converting = False
         self.gpu_check_complete = False
         
-        # Threading for thumbs
-        self.thumb_signaller = ThumbnailSignaller()
-        self.thumb_signaller.finished.connect(self.on_thumb_generated)
-
         # Threading for metadata (codec check)
         self.meta_signaller = MetadataSignaller()
         self.meta_signaller.finished.connect(self.on_metadata_ready)
@@ -542,173 +394,117 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(stats_layout)
         
         # === MAIN CONTENT ===
-        content_layout = QHBoxLayout()
-        content_layout.setSpacing(16)
+        content_layout = QVBoxLayout()
+        content_layout.setSpacing(10)
         
-        # --- Left: Queue ---
-        left_panel = QFrame()
-        left_panel.setObjectName("card")
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(16, 16, 16, 16)
-        left_layout.setSpacing(8)
+        # --- Top Toolbars ---
+        toolbar_container = QFrame()
+        toolbar_container.setObjectName("card")
+        top_layout = QHBoxLayout(toolbar_container)
+        top_layout.setContentsMargins(8, 6, 8, 6)
+        top_layout.setSpacing(8)
         
-        lbl_queue = QLabel("Conversion Queue")
-        lbl_queue.setObjectName("section_header")
-        left_layout.addWidget(lbl_queue)
-
-        # Filter Toolbar
-        filter_layout = QHBoxLayout()
-        self.chk_filter_hevc = QCheckBox("Only Show x265")
-        self.chk_filter_hevc.setToolTip("Show only files that are already HEVC/x265")
-        self.chk_filter_hevc.toggled.connect(self.apply_filters)
-        filter_layout.addWidget(self.chk_filter_hevc)
-        filter_layout.addStretch()
-        left_layout.addLayout(filter_layout)
-        
-        self.list_widget = QListWidget()
-        self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        # self.list_widget.itemSelectionChanged.connect(self.on_selection_changed) # Removed: Selection doesn't drive info anymore
-        left_layout.addWidget(self.list_widget)
-        
-        content_layout.addWidget(left_panel, stretch=1)
-        
-        # --- Right: Controls & Info ---
-        right_panel = QFrame()
-        right_panel.setObjectName("card")
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(16, 16, 16, 16)
-        right_layout.setSpacing(12)
-        
-        # Toolbar
-        btn_row1 = QHBoxLayout()
-        btn_row1.setSpacing(8)
-        
+        # Left: Add & Scan
         self.btn_add = QPushButton("➕ Add Files")
         self.btn_add.setObjectName("primary")
         self.btn_add.clicked.connect(self.browse_files)
-        
         self.btn_scan = QPushButton("📁 Scan Folder")
         self.btn_scan.setObjectName("primary")
         self.btn_scan.clicked.connect(self.browse_folder)
+        top_layout.addWidget(self.btn_add)
+        top_layout.addWidget(self.btn_scan)
         
-        btn_row1.addWidget(self.btn_add)
-        btn_row1.addWidget(self.btn_scan)
-        btn_row1.addStretch()
+        top_layout.addWidget(QLabel("|"))
         
-        btn_row2 = QHBoxLayout()
-        btn_row2.setSpacing(8)
+        # Filters & Options
+        self.chk_filter_hevc = QCheckBox("Hide x265/HEVC")
+        self.chk_filter_hevc.toggled.connect(self.apply_filters)
+        top_layout.addWidget(self.chk_filter_hevc)
         
+        top_layout.addWidget(QLabel("Parallel:"))
+        
+        # Segmented toggle buttons for parallel task count
+        from PyQt6.QtWidgets import QButtonGroup
+        self._parallel_group = QButtonGroup(self)
+        self._parallel_group.setExclusive(True)
+        _seg_style = """
+            QPushButton { 
+                min-width: 28px; max-width: 28px; min-height: 24px; max-height: 24px;
+                border: 1px solid #555; background: #2a2a3a; color: #ccc; 
+                font-weight: bold; font-size: 12px; 
+            }
+            QPushButton:checked { background: #7c3aed; color: white; border-color: #9f67ff; }
+            QPushButton:hover:!checked { background: #3a3a4a; }
+        """
+        for i in range(1, 4):
+            btn = QPushButton(str(i))
+            btn.setCheckable(True)
+            btn.setStyleSheet(_seg_style)
+            if i == 1:
+                btn.setChecked(True)
+            self._parallel_group.addButton(btn, i)
+            top_layout.addWidget(btn)
+        
+        # Compatibility shim: expose .value() and .setEnabled() like the old QSpinBox
+        class _ParallelAccessor:
+            def __init__(self, group):
+                self._group = group
+            def value(self):
+                return self._group.checkedId()
+            def setEnabled(self, enabled):
+                for b in self._group.buttons():
+                    b.setEnabled(enabled)
+        self.spin_parallel = _ParallelAccessor(self._parallel_group)
+        
+        self.chk_auto_delete = QCheckBox("Auto Delete Original")
+        self.chk_auto_delete.setChecked(True)
+        self.chk_auto_delete.setStyleSheet("color: #ffcccc;")
+        top_layout.addWidget(self.chk_auto_delete)
+        
+        top_layout.addStretch()
+        
+        # Right: Selection & Cache
         self.btn_sel_all = QPushButton("Select All")
         self.btn_sel_all.clicked.connect(self.select_all)
-        
         self.btn_sel_none = QPushButton("Deselect All")
         self.btn_sel_none.clicked.connect(self.deselect_all)
-        
         self.btn_clear = QPushButton("Clear List")
         self.btn_clear.clicked.connect(self.clear_list)
+        self.btn_clear_cache = QPushButton("🗑 Clear Cache")
+        self.btn_clear_cache.setToolTip("Clear the file details cache (forces ffprobe re-scan on next load)")
+        self.btn_clear_cache.clicked.connect(self.clear_cache)
         
-        self.btn_clear_cache = QPushButton("Delete Thumbs")
-        self.btn_clear_cache.setToolTip("Delete all cached thumbnails from disk")
-        self.btn_clear_cache.clicked.connect(self.clear_thumbnails)
-        
-        btn_row2.addWidget(self.btn_sel_all)
-        btn_row2.addWidget(self.btn_sel_none)
-        btn_row2.addWidget(self.btn_clear)
-        btn_row2.addWidget(self.btn_clear_cache)
-        
-        right_layout.addLayout(btn_row1)
-        right_layout.addLayout(btn_row2)
-        
+        top_layout.addWidget(self.btn_sel_all)
+        top_layout.addWidget(self.btn_sel_none)
+        top_layout.addWidget(self.btn_clear)
+        top_layout.addWidget(self.btn_clear_cache)
 
         
+        content_layout.addWidget(toolbar_container)
         
-        # File Info Panel (Unified)
-        self.grp_info = QFrame()
-        self.grp_info.setObjectName("info_panel")
-        info_panel_layout = QVBoxLayout(self.grp_info)
-        info_panel_layout.addWidget(QLabel("File Information"))
+        # --- Center: Queue ---
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        content_layout.addWidget(self.list_widget, stretch=1)
         
-        # Scroll Area for Combined Info Cards
-        self.scroll_info = QScrollArea()
-        self.scroll_info.setWidgetResizable(True)
-        self.scroll_info.setFrameShape(QFrame.Shape.NoFrame)
-        self.scroll_info.setStyleSheet("background: transparent; border: none;")
+        # --- Bottom: Controls & Status ---
+        bottom_container = QFrame()
+        bottom_container.setObjectName("card")
+        bottom_layout = QVBoxLayout(bottom_container)
+        bottom_layout.setContentsMargins(12, 12, 12, 12)
+        bottom_layout.setSpacing(8)
         
-        self.container_info = QWidget()
-        self.container_info.setStyleSheet("background: transparent;")
-        self.c_lay_info = QVBoxLayout(self.container_info)
-        self.c_lay_info.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.c_lay_info.setContentsMargins(0, 0, 0, 0)
-        self.c_lay_info.setSpacing(12)
-        
-        # Initial Placeholder
-        self.lbl_info_placeholder = QLabel("Select a file to view info.")
-        self.lbl_info_placeholder.setObjectName("placeholder")
-        self.lbl_info_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_info_placeholder.setStyleSheet("color: #666; margin-top: 20px;")
-        self.c_lay_info.addWidget(self.lbl_info_placeholder)
-        
-        self.scroll_info.setWidget(self.container_info)
-        info_panel_layout.addWidget(self.scroll_info)
-        
-        right_layout.addWidget(self.grp_info, stretch=1)
-
-        
-        # Compression Options
-        opt_group = QFrame()
-        opt_lay = QVBoxLayout(opt_group)
-        opt_lay.addWidget(QLabel("Compression Level"))
-        
-        self.radio_group = QButtonGroup(self)
-        self.radio_layout = QHBoxLayout()
-        self.radio_layout.setSpacing(20)
-        self.radios = []
-        
-        options = ["High Quality", "Balanced", "Compact", "Low Bitrate"]
-        for i, name in enumerate(options):
-            rb = QRadioButton(name)
-            self.radio_group.addButton(rb, i)
-            self.radio_layout.addWidget(rb)
-            self.radios.append(rb)
-            rb.toggled.connect(self.update_output_preview)
-            
-        self.radios[3].setChecked(True) # Low Bitrate default
-        opt_lay.addLayout(self.radio_layout)
-        
-        # Parallel Task Selector - NEW
-        parallel_layout = QHBoxLayout()
-        parallel_layout.addWidget(QLabel("Parallel Tasks:"))
-        self.spin_parallel = QSpinBox()
-        self.spin_parallel.setRange(1, 3)
-        self.spin_parallel.setValue(1)
-        self.spin_parallel.setToolTip("Number of simultaneous conversions. Increase for high-end GPUs.")
-        parallel_layout.addWidget(self.spin_parallel)
-        parallel_layout.addStretch()
-        
-        parallel_layout.addStretch()
-        
-        opt_lay.addLayout(parallel_layout)
-        
-        # Auto Delete Toggle - NEW
-        self.chk_auto_delete = QCheckBox("Auto Delete Original")
-        self.chk_auto_delete.setStyleSheet("color: #ffcccc;") # Light red hint
-        opt_lay.addWidget(self.chk_auto_delete)
-
-
-
-        right_layout.addWidget(opt_group)
-        
-        # Start Conversion Button
         self.btn_convert = QPushButton("▶️ Start Batch Conversion")
         self.btn_convert.setObjectName("success")
-        self.btn_convert.setMinimumHeight(50)
-        # self.btn_convert.setStyleSheet(...) # Removed for theme.py
+        self.btn_convert.setMinimumHeight(45)
         self.btn_convert.clicked.connect(self.start_conversion)
         self.btn_convert.setEnabled(False)
+        bottom_layout.addWidget(self.btn_convert)
         
         self.progress = QProgressBar()
         self.progress.setTextVisible(True)
         self.progress.setFormat("%p%")
+        bottom_layout.addWidget(self.progress)
         
         status_layout = QHBoxLayout()
         self.lbl_status = QLabel("Ready")
@@ -716,12 +512,10 @@ class MainWindow(QMainWindow):
         status_layout.addWidget(self.lbl_status)
         status_layout.addStretch()
         status_layout.addWidget(self.lbl_eta)
+        bottom_layout.addLayout(status_layout)
         
-        right_layout.addWidget(self.btn_convert)
-        right_layout.addWidget(self.progress)
-        right_layout.addLayout(status_layout)
+        content_layout.addWidget(bottom_container)
         
-        content_layout.addWidget(right_panel, stretch=2)
         main_layout.addLayout(content_layout, stretch=1)
 
     def apply_filters(self):
@@ -836,7 +630,8 @@ class MainWindow(QMainWindow):
                 'width': w,
                 'height': h,
                 'codec': codec,
-                'info': info or {}
+                'info': info or {},
+                'profile_idx': widget.combo_quality.currentIndex()
             })
             
         return files_data
@@ -850,29 +645,17 @@ class MainWindow(QMainWindow):
             elif item.layout():
                 self._clear_layout(item.layout())
     
-    def _update_info_panel(self, files_data):
-        """Update unified info panel with combined cards for each file"""
-        self._clear_layout(self.c_lay_info)
-        
-        if not files_data:
-            # Recreate placeholder since it might have been deleted by _clear_layout
-            self.lbl_info_placeholder = QLabel("Select a file to view info.")
-            self.lbl_info_placeholder.setObjectName("placeholder")
-            self.lbl_info_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.lbl_info_placeholder.setStyleSheet("color: #666; margin-top: 20px;")
-            self.c_lay_info.addWidget(self.lbl_info_placeholder)
-            return
-        
-        # Get current profile selection
-        profile_idx = self.radio_group.checkedId()
-        
-        # Create combined card for each file
-        for data in files_data:
-            # Calculate bitrates for this file
-            bitrates = calculate_quality_options(data['size'], data['duration'], data['info'])
-            card = CombinedInfoCard(data, profile_idx, bitrates, self.has_gpu)
-            self.c_lay_info.addWidget(card)
-
+    def clear_cache(self):
+        """Clear the scan/details cache and reset the LRU cache on get_video_info."""
+        try:
+            ScanCache().clear()
+            # Also reset the in-memory LRU cache so re-probes are fresh
+            get_video_info.cache_clear()
+            self.lbl_status.setText("Cache cleared.")
+            logger.info("File details cache cleared by user.")
+        except Exception as e:
+            logger.error(f"Failed to clear cache: {e}")
+            self.lbl_status.setText("Failed to clear cache.")
 
     # --- Logic ---
 
@@ -1056,20 +839,19 @@ class MainWindow(QMainWindow):
         self.add_files(found_files)
         self.lbl_status.setText("Ready")
 
-    def add_files(self, paths: List[str]):
+    def add_files(self, paths: list[str]):
         new_items_added = False
+        import os
+        from ..utils.helpers import normalize_path
         for path in paths:
             path = normalize_path(path)
-            # Check duplicates O(1)
-            if path in self.added_paths:
+            if path in getattr(self, 'added_paths', set()):
                 continue
                 
             self.added_paths.add(path)
             new_items_added = True
 
-            # Create sortable item
             item = SortableListWidgetItem(self.list_widget)
-            item.setSizeHint(QSize(0, 60))
             
             try:
                 item.file_size = os.path.getsize(path)
@@ -1077,31 +859,49 @@ class MainWindow(QMainWindow):
                 item.file_size = 0
             
             widget = FileListItem(path)
-            # Icons are set in FileListItem init
+            # Size hint: use widget's natural height so nothing gets clipped
+            item.setSizeHint(widget.sizeHint())
             
             widget.checkbox.toggled.connect(self.on_active_data_changed)
+            widget.combo_quality.currentIndexChanged.connect(self.on_active_data_changed)
             widget.btn_compare.clicked.connect(lambda ch, w=widget: self.open_compare(w))
             widget.btn_remove.clicked.connect(lambda ch, it=item: self.remove_item(it))
             
             self.list_widget.setItemWidget(item, widget)
-            
-            # Queue thumbnail generation in ThreadPool
-            task = ThumbnailRunnable(path, self.thumb_signaller)
-            self.thread_pool.start(task)
-            
-            # Queue metadata code check
-            meta_task = MetadataRunnable(path, self.meta_signaller)
-            self.thread_pool.start(meta_task)
+
+            # Try to populate immediately from cache
+            needs_probe = True
+            try:
+                st = os.stat(path)
+                cached = ScanCache().get_cached_details(path, st.st_mtime, st.st_size)
+                if cached:
+                    widget.video_info = {
+                        'streams': [{
+                            'codec_type': 'video',
+                            'codec_name': cached['codec'],
+                            'width': cached['width'],
+                            'height': cached['height'],
+                        }],
+                        'format': {'duration': str(cached['duration'])}
+                    }
+                    widget.codec = cached['codec']
+                    widget.refresh_details()
+                    needs_probe = False
+            except OSError:
+                pass
+
+            # Queue metadata probe only when not already cached
+            if needs_probe:
+                meta_task = MetadataRunnable(path, getattr(self, 'meta_signaller'))
+                self.thread_pool.start(meta_task)
             
         if new_items_added:
-            # Trigger sort (Descending = Heaviest First)
+            from PyQt6.QtCore import Qt
             self.list_widget.sortItems(Qt.SortOrder.DescendingOrder)
-            
             self.update_convert_btn()
             
             if self.list_widget.count() > 0 and self.list_widget.currentRow() == -1:
                 self.list_widget.setCurrentRow(0)
-                # self.on_selection_changed()
         
         self.apply_filters()
         self.update_dashboard_counts()
@@ -1133,20 +933,9 @@ class MainWindow(QMainWindow):
 
 
 
-    def on_thumb_generated(self, path, thumb_path):
-        for i in range(self.list_widget.count()):
-            item = self.list_widget.item(i)
-            widget = self.list_widget.itemWidget(item)
-            if widget.path == path:
-                widget.set_thumbnail(thumb_path)
-                break
-
-    def on_metadata_ready(self, path, codec):
+    def on_metadata_ready(self, path, info_dict, codec):
         """Called when metadata is ready"""
-        # Save to cache here (Main Thread = Serialized)
         try:
-            # We fetch file stats again or trust they haven't changed in sub-second time.
-            # Re-fetch is safer for consistent cache key
             st = os.stat(path)
             from ..utils.scan_cache import ScanCache
             cache = ScanCache()
@@ -1155,12 +944,13 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error(f"Failed to update cache in UI thread: {e}")
 
-        # Update widget info if present
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             widget = self.list_widget.itemWidget(item)
             if widget.path == path:
-                # Re-apply filters to update visibility
+                widget.video_info = info_dict
+                widget.codec = codec
+                widget.refresh_details()
                 self.apply_filters()
                 break
 
@@ -1170,28 +960,10 @@ class MainWindow(QMainWindow):
         pass
 
     def on_active_data_changed(self):
-        """Handle data changes (checkbox toggles)"""
+        """Handle data changes (checkbox toggles and combo updates)"""
         files_data = self._get_checked_files_data()
         
         # Update file info panel
-        self._update_info_panel(files_data)
-        
-        # Update bitrate options for single file compatibility (for correct radio labels)
-        if len(files_data) == 1:
-            f = files_data[0]
-            self.bitrate_options = calculate_quality_options(f['size'], f['duration'], f['info'])
-            
-            # Update radio labels with sizes
-            for i, rb in enumerate(self.radios):
-                if i < len(self.bitrate_options):
-                    opt = self.bitrate_options[i]
-                    rb.setText(f"{opt['name']} (~{format_size(opt['estimated_size'])})")
-        else:
-            # Multi-file: Reset labels to default names
-            options = ["High Quality", "Balanced", "Compact", "Low Bitrate"]
-            for i, name in enumerate(options):
-                if i < len(self.radios):
-                    self.radios[i].setText(name)
         
         # Update button state
         self.update_convert_btn()
@@ -1199,7 +971,6 @@ class MainWindow(QMainWindow):
     def update_output_preview(self):
         """Update info panel based on current selection"""
         files_data = self._get_checked_files_data()
-        self._update_info_panel(files_data)
 
     def update_convert_btn(self):
         count = 0
@@ -1260,23 +1031,12 @@ class MainWindow(QMainWindow):
         self.update_dashboard_counts()
         self._update_info_panel([])
 
-    def clear_thumbnails(self):
-        ret = QMessageBox.question(self, "Clear Cache", "Delete all cached thumbnails?\nThis cannot be undone.", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if ret == QMessageBox.StandardButton.Yes:
-            try:
-                ThumbnailCache().clear()
-                # Reload UI thumbnails? No, just clearing disk cache is enough as per request.
-                QMessageBox.information(self, "Success", "Thumbnail cache cleared.")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to clear cache: {e}")
-
     def start_conversion(self):
         # Check if already running (Stop action)
         if hasattr(self, 'is_converting') and self.is_converting:
             self.stop_conversion()
             return
             
-        profile_idx = self.radio_group.checkedId()
         items = []
         for i in range(self.list_widget.count()):
             w = self.list_widget.itemWidget(self.list_widget.item(i))
@@ -1284,7 +1044,7 @@ class MainWindow(QMainWindow):
                 # Construct item dict for Worker
                 items.append({
                     'path': w.path, 
-                    'profile_idx': profile_idx,
+                    'profile_idx': w.combo_quality.currentIndex(),
                     'delete_flag': self.chk_auto_delete.isChecked()
                 })
                 
@@ -1430,11 +1190,7 @@ class MainWindow(QMainWindow):
                     self.added_paths.remove(path)
                 
                 # Cleanup Cache
-                try:
-                    ThumbnailCache().remove_entry(path)
-                    logger.info(f"Cleaned up cache for deleted file: {path}")
-                except Exception as e:
-                    logger.error(f"Failed to clean cache for {path}: {e}")
+                logger.info(f"Cleaned up file from UI: {path}")
                 
                 self.update_dashboard_counts()
                 self.update_convert_btn()

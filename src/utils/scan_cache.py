@@ -50,12 +50,43 @@ class ScanCache:
                 return entry.get('codec')
         return None
 
+    def get_cached_details(self, path: str, mtime: float, size: int) -> Optional[Dict]:
+        """Returns full cached details dict {codec, width, height, duration} if fresh, else None."""
+        key = str(path)
+        if key in self.cache:
+            entry = self.cache[key]
+            if entry.get('mtime') == mtime and entry.get('size') == size:
+                if 'width' in entry:  # full details stored
+                    return {
+                        'codec': entry.get('codec', 'Unknown'),
+                        'width': entry.get('width', 0),
+                        'height': entry.get('height', 0),
+                        'duration': entry.get('duration', 0.0),
+                    }
+        return None
+
     def update_result(self, path: str, mtime: float, size: int, codec: str):
+        key = str(path)
+        existing = self.cache.get(key, {})
+        existing.update({
+            'mtime': mtime,
+            'size': size,
+            'codec': codec,
+            'timestamp': time.time()
+        })
+        self.cache[key] = existing
+
+    def update_details(self, path: str, mtime: float, size: int, codec: str,
+                       width: int, height: int, duration: float):
+        """Store full video details (superset of update_result)."""
         key = str(path)
         self.cache[key] = {
             'mtime': mtime,
             'size': size,
             'codec': codec,
+            'width': width,
+            'height': height,
+            'duration': duration,
             'timestamp': time.time()
         }
 
@@ -64,3 +95,8 @@ class ScanCache:
         if key in self.cache:
             del self.cache[key]
             self.save()
+
+    def clear(self):
+        """Wipe all cached entries and persist the empty cache."""
+        self.cache = {}
+        self.save()
